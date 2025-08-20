@@ -3,6 +3,9 @@
 import express from "express";
 import bodyParser from "body-parser";
 import { WebSocketServer } from "ws";
+import textToSpeech from "@google-cloud/text-to-speech";
+const ttsClient = new textToSpeech.TextToSpeechClient();
+
 
 /* ===================== ENV / SECRETS ===================== */
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID || "";
