@@ -1,4 +1,4 @@
-// server.js — Twilio <-> Cloud Run bridge with outbound, TTS greeting, STT listening, and TTS reply (ESM)
+// server.js — Twilio <-> Cloud Run bridge with outbound, TTS greeting, STT listening & reply (ESM)
 
 import express from "express";
 import bodyParser from "body-parser";
@@ -12,13 +12,13 @@ const speechClient = new speech.SpeechClient();
 /* ===================== ENV / SECRETS ===================== */
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_FROM  = process.env.TWILIO_FROM        || ""; // e.g. +17755490708
+const TWILIO_FROM  = process.env.TWILIO_FROM        || ""; // e.g., +17755490708
 
 const mask = (s) => (s ? s.replace(/^(.{6}).*(.{4})$/, "$1…$2") : "(missing)");
 console.log("[boot] TWILIO_ACCOUNT_SID:", mask(TWILIO_SID));
 console.log("[boot] TWILIO_FROM:", TWILIO_FROM || "(missing)");
 
-/* ===================== μ-LAW BEEP (warm-up tone) ===================== */
+/* ===================== μ-LAW BEEP (warm-up) ===================== */
 const MU_LAW_MAX = 0x1FFF, BIAS = 0x84, QUANT_MASK = 0x0F, SEG_SHIFT = 4;
 function linear2ulaw(sample) {
   let pcm = Math.max(-32768, Math.min(32767, sample));
@@ -38,30 +38,27 @@ function makeBeepFrames({ secs = 1, freq = 440 }) {
     ulaw[i] = linear2ulaw((s * 32767) | 0);
   }
   const frames = [];
-  for (let i = 0; i < ulaw.length; i += 160) {
-    frames.push(Buffer.from(ulaw.slice(i, i + 160)).toString("base64"));
+  for (let i = 0; i < ulaw.length; i += CHUNK) {
+    frames.push(Buffer.from(ulaw.slice(i, i + CHUNK)).toString("base64"));
   }
   return frames;
 }
 const BEEP_FRAMES = makeBeepFrames({ secs: 1, freq: 440 });
 
 /* ===================== TTS (μ-law 8k) ===================== */
-async function ttsMuLawFrames(
-  text,
-  { languageCode = "en-IN", sampleRateHertz = 8000 } = {}
-) {
+async function ttsMuLawFrames(text, { languageCode = "en-IN", sampleRateHertz = 8000 } = {}) {
   const [resp] = await ttsClient.synthesizeSpeech({
     input: { text },
-    voice: { languageCode },                   // Cloud will pick a default voice for the locale
-    audioConfig: { audioEncoding: "MULAW", sampleRateHertz },
+    voice: { languageCode }, // Cloud picks a default voice for the locale
+    audioConfig: { audioEncoding: "MULAW", sampleRateHertz }
   });
   const audio = resp.audioContent || new Uint8Array();
-  const CHUNK = 160; // 20 ms @ 8 kHz
-  const out = [];
+  const CHUNK = 160; // 20 ms @ 8k
+  const frames = [];
   for (let i = 0; i < audio.length; i += CHUNK) {
-    out.push(Buffer.from(audio.subarray(i, i + CHUNK)).toString("base64"));
+    frames.push(Buffer.from(audio.subarray(i, i + CHUNK)).toString("base64"));
   }
-  return out;
+  return frames;
 }
 
 /* ===================== App + TwiML ===================== */
@@ -78,7 +75,9 @@ app.post("/voice", (req, res) => {
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say>Connecting you to the Okomo three sixty assistant.</Say>
-  <Connect><Stream url="${wsUrl}"/></Connect>
+  <Connect>
+    <Stream url="${wsUrl}" track="inbound_audio"/>
+  </Connect>
 </Response>`;
   res.type("text/xml").send(twiml);
 });
@@ -109,7 +108,7 @@ app.post("/call", async (req, res) => {
   try {
     const to = (req.body?.to || "").trim();
     const from = (req.body?.from || "").trim();
-    if (!/^\+\d{8,15}$/.test(to)) return res.status(400).json({ error: "`to` must be E.164" });
+    if (!/^\+\d{8,15}$/.test(to))  return res.status(400).json({ error: "`to` must be E.164" });
     if (from && !/^\+\d{8,15}$/.test(from)) return res.status(400).json({ error: "`from` must be E.164" });
     const voiceUrl = `https://${req.get("host")}/voice`;
     const call = await twilioCreateCall({ to, from, voiceUrl });
@@ -138,7 +137,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
 
 /* ===================== Tiny dialog stub ===================== */
 function draftReply(utterance) {
-  const u = utterance.toLowerCase();
+  const u = (utterance || "").toLowerCase();
   if (u.includes("hello") || u.includes("hi")) {
     return "Hello! I’m the Okomo three sixty assistant. We create immersive virtual reality wedding experiences. Would you like to book a short in person meeting this week?";
   }
@@ -161,10 +160,10 @@ wss.on("connection", (ws) => {
   console.log("[ws] connected");
   let streamSid = null;
 
-  // recognition state for this call
   let sttStream = null;
-  let speaking = false;      // when true we ignore incoming audio
+  let speaking  = false;
   let sttClosed = false;
+  let mediaCount = 0;
 
   function startSTTStream() {
     sttClosed = false;
@@ -177,7 +176,7 @@ wss.on("connection", (ws) => {
         model: "phone_call",
       },
       interimResults: true,
-      singleUtterance: true, // auto end when caller stops
+      singleUtterance: true,
     };
     sttStream = speechClient
       .streamingRecognize(request)
@@ -190,14 +189,11 @@ wss.on("connection", (ws) => {
         if (result.isFinal) {
           console.log("[stt] final:", transcript);
 
-          // simple dialog -> TTS
           const reply = draftReply(transcript);
+          speaking = true;
 
-          speaking = true;     // stop writing mic to STT during TTS
           try {
             const frames = await ttsMuLawFrames(reply, { languageCode: "en-IN" });
-
-            // play the TTS frames
             let i = 0;
             const t = setInterval(() => {
               if (ws.readyState !== ws.OPEN) { clearInterval(t); return; }
@@ -205,18 +201,10 @@ wss.on("connection", (ws) => {
                 clearInterval(t);
                 ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: `tts-${Date.now()}` } }));
                 speaking = false;
-
-                // start a fresh STT stream for the next turn
-                setTimeout(() => {
-                  if (ws.readyState === ws.OPEN) startSTTStream();
-                }, 50);
+                setTimeout(() => { if (ws.readyState === ws.OPEN) startSTTStream(); }, 50);
                 return;
               }
-              ws.send(JSON.stringify({
-                event: "media",
-                streamSid,
-                media: { payload: frames[i++] }
-              }));
+              ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: frames[i++] } }));
             }, 20);
           } catch (e) {
             console.error("[tts] error", e);
@@ -224,18 +212,13 @@ wss.on("connection", (ws) => {
             setTimeout(() => startSTTStream(), 100);
           }
 
-          // close this recognition turn
-          try { sttStream?.end(); } catch { /* ignore */ }
+          try { sttStream?.end(); } catch {}
           sttClosed = true;
         } else {
-          // interim
           // console.log("[stt] interim:", transcript);
         }
       })
-      .on("end", () => {
-        sttClosed = true;
-        // console.log("[stt] ended");
-      });
+      .on("end", () => { sttClosed = true; });
   }
 
   ws.on("message", async (raw) => {
@@ -250,18 +233,18 @@ wss.on("connection", (ws) => {
         streamSid = msg.start?.streamSid;
         console.log("[ws] start", streamSid, "tracks:", msg.start?.tracks);
 
-        // clear any buffered audio
+        // Clear any buffered audio
         ws.send(JSON.stringify({ event: "clear", streamSid }));
 
-        // (optional) short beep
+        // Beep
         let i = 0;
-        const t = setInterval(() => {
-          if (ws.readyState !== ws.OPEN) { clearInterval(t); return; }
-          if (i >= BEEP_FRAMES.length) { clearInterval(t); return; }
+        const tb = setInterval(() => {
+          if (ws.readyState !== ws.OPEN) { clearInterval(tb); return; }
+          if (i >= BEEP_FRAMES.length) { clearInterval(tb); return; }
           ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: BEEP_FRAMES[i++] } }));
         }, 20);
 
-        // send greeting via TTS (non-blocking)
+        // Greeting (non-blocking)
         (async () => {
           const greet = "Hi, this is the Okomo three sixty assistant. We help plan immersive VR wedding experiences. How can I help today?";
           const gf = await ttsMuLawFrames(greet, { languageCode: "en-IN" });
@@ -273,26 +256,25 @@ wss.on("connection", (ws) => {
           }, 20);
         })().catch(console.error);
 
-        // start 1st recognition stream
         startSTTStream();
       }
 
       else if (msg.event === "media") {
-        if (speaking) return; // ignore mic while we are speaking
-        // Twilio sends μ-law 8k frames as base64
+        mediaCount++;
+        if (mediaCount % 50 === 0) console.log("[ws] media frames:", mediaCount);
+        if (speaking) return;
         const b = Buffer.from(msg.media?.payload || "", "base64");
         if (b.length && sttStream && !sttClosed) {
+          // You can also do: sttStream.write({ audioContent: b });
           sttStream.write(b);
         }
       }
 
       else if (msg.event === "mark") {
-        // mark ack from Twilio (end of a playback we marked)
-        // console.log("[ws] mark ack:", msg.mark?.name);
+        // ack from Twilio for our 'mark'
       }
 
       else if (msg.event === "stop") {
-        // end recognition cleanly
         try { sttStream?.end(); } catch {}
         console.log("[ws] stop", streamSid);
       }
@@ -301,12 +283,11 @@ wss.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => {
-    try { sttStream?.end(); } catch {}
-    console.log("[ws] closed");
-  });
+  ws.on("close", () => { try { sttStream?.end(); } catch {}; console.log("[ws] closed"); });
   ws.on("error", (e) => console.error("[ws] error", e));
 });
+
+
 
 
 
