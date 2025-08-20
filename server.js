@@ -1,23 +1,22 @@
-// server.js — Twilio <-> Cloud Run bridge (ESM), with beep + diagnostics
+// server.js — Twilio <-> Cloud Run bridge (ESM), with beep + TTS greeting + diagnostics
 
 import express from "express";
 import bodyParser from "body-parser";
 import { WebSocketServer } from "ws";
 import textToSpeech from "@google-cloud/text-to-speech";
-const ttsClient = new textToSpeech.TextToSpeechClient();
 
+const ttsClient = new textToSpeech.TextToSpeechClient();
 
 /* ===================== ENV / SECRETS ===================== */
 const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID || "";
 const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN  || "";
-const TWILIO_FROM  = process.env.TWILIO_FROM        || ""; // e.g., +17755490708 (Twilio-owned) or a verified caller ID
+const TWILIO_FROM  = process.env.TWILIO_FROM        || ""; // e.g., +17755490708 or a verified caller ID
 
 const mask = (s) => (s ? s.replace(/^(.{6}).*(.{4})$/, "$1…$2") : "(missing)");
 console.log("[boot] TWILIO_ACCOUNT_SID:", mask(TWILIO_SID));
 console.log("[boot] TWILIO_FROM:", TWILIO_FROM || "(missing)");
 
 /* ===================== μ-LAW + BEEP HELPERS ===================== */
-// μ-law constants
 const MU_LAW_MAX = 0x1FFF, BIAS = 0x84, QUANT_MASK = 0x0F, SEG_SHIFT = 4;
 
 function linear2ulaw(sample) {
@@ -31,7 +30,6 @@ function linear2ulaw(sample) {
   return ~(uval | sign) & 0xFF;
 }
 
-// precompute a 2-second A4 beep at 8 kHz, chunked into 20 ms (160-sample) frames
 function makeBeepFrames({ secs = 2, freq = 440 }) {
   const sr = 8000, N = sr * secs, CHUNK = 160;
   const ulaw = new Uint8Array(N);
@@ -46,6 +44,40 @@ function makeBeepFrames({ secs = 2, freq = 440 }) {
   return frames;
 }
 const BEEP_FRAMES = makeBeepFrames({ secs: 2, freq: 440 });
+
+/* ===================== TTS (μ-law 8k) ===================== */
+async function ttsMuLawFrames(text, { languageCode = "en-IN", sampleRateHertz = 8000 } = {}) {
+  const [resp] = await ttsClient.synthesizeSpeech({
+    input: { text },
+    voice: { languageCode }, // "en-IN" for Indian English; use "en-US" if you prefer
+    audioConfig: { audioEncoding: "MULAW", sampleRateHertz }
+  });
+  const audio = resp.audioContent || Buffer.alloc(0); // μ-law 8k bytes
+
+  const CHUNK = 160; // 20 ms @ 8 kHz for Twilio
+  const frames = [];
+  for (let i = 0; i < audio.length; i += CHUNK) {
+    frames.push(Buffer.from(audio.subarray(i, i + CHUNK)).toString("base64"));
+  }
+  return frames;
+}
+
+function streamFrames(ws, streamSid, frames, onDone) {
+  let i = 0;
+  const t = setInterval(() => {
+    if (ws.readyState !== ws.OPEN) { clearInterval(t); return; }
+    if (i >= frames.length) {
+      clearInterval(t);
+      if (typeof onDone === "function") onDone();
+      return;
+    }
+    ws.send(JSON.stringify({
+      event: "media",
+      streamSid,
+      media: { payload: frames[i++] }
+    }));
+  }, 20); // 20ms per frame
+}
 
 /* ===================== APP ===================== */
 const app = express();
@@ -80,16 +112,16 @@ async function twilioCreateCall({ to, from, voiceUrl }) {
     To: to,
     From: from || TWILIO_FROM,  // allow per-request override
     Url: voiceUrl,
-    Method: "POST",
+    Method: "POST"
   }).toString();
 
   const r = await fetch(api, {
     method: "POST",
     headers: {
       "Authorization": "Basic " + Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64"),
-      "Content-Type": "application/x-www-form-urlencoded",
+      "Content-Type": "application/x-www-form-urlencoded"
     },
-    body,
+    body
   });
 
   if (!r.ok) {
@@ -166,7 +198,7 @@ wss.on("connection", (ws) => {
   console.log("[ws] connected");
   let streamSid = null;
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw.toString());
 
@@ -182,25 +214,33 @@ wss.on("connection", (ws) => {
         ws.send(JSON.stringify({ event: "clear", streamSid }));
 
         // 2) small delay so Twilio is ready to play
-        setTimeout(() => {
-          // 3) send 2s beep @20ms per frame
-          let i = 0;
-          const t = setInterval(() => {
-            if (ws.readyState !== ws.OPEN) { clearInterval(t); return; }
-            if (i >= BEEP_FRAMES.length) {
-              clearInterval(t);
-              // 4) send 'mark' so Twilio can ack playback completion
+        setTimeout(async () => {
+          try {
+            // A) Beep first (2s)
+            streamFrames(ws, streamSid, BEEP_FRAMES, () => {
               const label = `beep-${Date.now()}`;
               ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: label } }));
               console.log("[ws] mark sent:", label);
-              return;
-            }
-            ws.send(JSON.stringify({
-              event: "media",
-              streamSid,
-              media: { payload: BEEP_FRAMES[i++] }
-            }));
-          }, 20);
+            });
+
+            // B) Then TTS greeting
+            const script =
+              "Hi, this is the Okomo three sixty assistant. " +
+              "We help plan immersive V R wedding experiences. " +
+              "May I confirm a good time to meet you in person this week?";
+            const frames = await ttsMuLawFrames(script, { languageCode: "en-IN", sampleRateHertz: 8000 });
+
+            // Start TTS after the beep finishes (~2s + a small guard)
+            setTimeout(() => {
+              streamFrames(ws, streamSid, frames, () => {
+                const label = `tts-${Date.now()}`;
+                ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: label } }));
+                console.log("[ws] TTS mark sent:", label);
+              });
+            }, 2200);
+          } catch (e) {
+            console.error("[ws] TTS error", e);
+          }
         }, 200);
       }
 
@@ -223,6 +263,7 @@ wss.on("connection", (ws) => {
   ws.on("close", () => console.log("[ws] closed"));
   ws.on("error", (e) => console.error("[ws] error", e));
 });
+
 
 
 
